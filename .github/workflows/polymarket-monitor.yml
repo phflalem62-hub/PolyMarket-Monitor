@@ -2,11 +2,18 @@ name: Polymarket Monitor
 
 on:
   schedule:
-    - cron: "2-59/5 * * * *"  # roda a cada 5 minutos, deslocado da hora cheia
-  workflow_dispatch: {}     # permite rodar manualmente pelo site do GitHub
+    - cron: "2-59/5 * * * *"  # roda a cada 5 minutos (deslocado da hora cheia)
+  workflow_dispatch: {}        # permite rodar manualmente ou via cron externo
+
+# Impede execuções sobrepostas: se uma nova chamada chegar enquanto a
+# anterior ainda está rodando, ela entra na fila e espera terminar,
+# ao invés de rodar em paralelo (o que causava mensagens duplicadas).
+concurrency:
+  group: polymarket-monitor
+  cancel-in-progress: false
 
 permissions:
-  contents: write  # necessário para o workflow commitar o state.json de volta
+  contents: write
 
 jobs:
   check-activity:
@@ -37,7 +44,13 @@ jobs:
           if ! git diff --quiet state.json; then
             git add state.json
             git commit -m "Atualiza estado do monitor"
-            git push
+            # tenta até 3 vezes, puxando mudanças novas antes de reenviar,
+            # caso outra execução tenha commitado algo entre o checkout e agora
+            for i in 1 2 3; do
+              git pull --rebase && git push && break
+              echo "Tentativa $i falhou, tentando de novo..."
+              sleep 3
+            done
           else
             echo "Nada para commitar."
           fi
