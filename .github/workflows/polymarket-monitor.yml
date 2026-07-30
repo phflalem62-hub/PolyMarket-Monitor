@@ -1,0 +1,43 @@
+name: Polymarket Monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"  # roda a cada 5 minutos
+  workflow_dispatch: {}     # permite rodar manualmente pelo site do GitHub
+
+permissions:
+  contents: write  # necessário para o workflow commitar o state.json de volta
+
+jobs:
+  check-activity:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Rodar monitor
+        env:
+          WALLET_ADDRESS: ${{ secrets.WALLET_ADDRESS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor.py
+
+      - name: Salvar estado atualizado
+        run: |
+          git config user.name "polymarket-monitor-bot"
+          git config user.email "actions@github.com"
+          if ! git diff --quiet state.json; then
+            git add state.json
+            git commit -m "Atualiza estado do monitor"
+            git push
+          else
+            echo "Nada para commitar."
+          fi
