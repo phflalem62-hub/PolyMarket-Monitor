@@ -15,6 +15,7 @@ no repositório a cada execução.
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -22,6 +23,13 @@ import requests
 WALLET_ADDRESS = os.environ["WALLET_ADDRESS"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+
+# Por quanto tempo (em segundos) o script fica rodando em loop dentro de
+# uma única execução do GitHub Actions, e de quanto em quanto tempo checa.
+# 270s (4m30s) com checagem a cada 30s garante que ele termina antes do
+# próximo agendamento do cron (a cada 5 minutos), sem sobrepor execuções.
+LOOP_DURATION_SECONDS = 270
+POLL_INTERVAL_SECONDS = 30
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 ACTIVITY_URL = "https://data-api.polymarket.com/activity"
@@ -94,10 +102,8 @@ def send_telegram_message(text: str) -> None:
         print(f"[ERRO] Falha ao enviar mensagem no Telegram: {resp.status_code} {resp.text}")
 
 
-def main():
-    last_seen_ts = load_last_seen_timestamp()
-    first_run = last_seen_ts == 0
-
+def check_once(last_seen_ts: int, first_run: bool) -> int:
+    """Faz uma checagem e retorna o novo last_seen_ts."""
     activities = fetch_activity(WALLET_ADDRESS, limit=20)
 
     if first_run:
@@ -106,7 +112,8 @@ def main():
             newest_ts = int(activities[0]["timestamp"])
             save_last_seen_timestamp(newest_ts)
             print(f"Primeira execução: marcando ponto de partida em {newest_ts}.")
-        return
+            return newest_ts
+        return last_seen_ts
 
     new_activities = [a for a in activities if int(a.get("timestamp", 0)) > last_seen_ts]
     new_activities.reverse()  # manda em ordem cronológica
@@ -121,6 +128,26 @@ def main():
         save_last_seen_timestamp(last_seen_ts)
     else:
         print("Nenhuma atividade nova.")
+
+    return last_seen_ts
+
+
+def main():
+    last_seen_ts = load_last_seen_timestamp()
+    first_run = last_seen_ts == 0
+
+    start_time = time.monotonic()
+    while True:
+        try:
+            last_seen_ts = check_once(last_seen_ts, first_run)
+            first_run = False
+        except requests.RequestException as e:
+            print(f"[ERRO] Falha ao consultar a API da Polymarket: {e}")
+
+        elapsed = time.monotonic() - start_time
+        if elapsed + POLL_INTERVAL_SECONDS > LOOP_DURATION_SECONDS:
+            break
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
