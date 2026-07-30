@@ -92,12 +92,25 @@ def format_message(activity: dict) -> str:
     if ts:
         dt_str = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
 
+    # Converte o "preço" (probabilidade entre 0 e 1) para odd decimal (formato
+    # usado em casas de apostas tipo Bet365/Betano): odd = 1 / preço
+    odd_str = None
+    if price:
+        try:
+            price_float = float(price)
+            if price_float > 0:
+                odd_str = f"{1 / price_float:.2f}"
+        except (TypeError, ValueError):
+            pass
+
     lines = [
         "🔔 <b>Nova entrada no Polymarket</b>",
         f"📊 {title}",
         f"↳ Outcome: <b>{outcome}</b> | Lado: <b>{side}</b>",
     ]
-    if price is not None:
+    if odd_str is not None:
+        lines.append(f"↳ Odd: <b>{odd_str}</b> (preço: {price})")
+    elif price is not None:
         lines.append(f"↳ Preço: {price}")
     if size is not None:
         lines.append(f"↳ Tamanho: {size}")
