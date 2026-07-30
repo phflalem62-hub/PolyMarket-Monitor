@@ -1,21 +1,27 @@
 """
 Monitor de atividade no Polymarket -> alertas no Telegram
-Versão para rodar no GitHub Actions (execução única a cada agendamento,
-não fica em loop -- quem cuida da repetição é o cron do GitHub Actions).
+Versão para rodar no GitHub Actions, disparada por um cron externo
+(cron-job.org) a cada 1 minuto. Cada execução faz UMA única checagem
+e encerra -- quem cuida da frequência é o cron externo, não um loop
+interno (evita execuções sobrepostas).
 
 Configuração via variáveis de ambiente (definidas como Secrets no GitHub):
 - WALLET_ADDRESS
 - TELEGRAM_BOT_TOKEN
 - TELEGRAM_CHAT_ID
 
-O estado (última atividade já notificada) é salvo em state.json,
-que este script atualiza e o workflow do GitHub Actions commita de volta
-no repositório a cada execução.
+O estado (último horário visto + IDs recentes já notificados) é salvo em
+state.json, que este script atualiza e o workflow do GitHub Actions commita
+de volta no repositório a cada execução.
+
+Proteção contra duplicatas: além de comparar por horário, cada trade tem um
+identificador único (transactionHash + detalhes do trade) guardado numa lista
+dos últimos vistos. Mesmo que a mesma atividade apareça de novo numa consulta
+seguinte, ela não é reenviada.
 """
 
 import json
 import os
-import time
 from datetime import datetime, timezone
 
 import requests
@@ -24,32 +30,41 @@ WALLET_ADDRESS = os.environ["WALLET_ADDRESS"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# Por quanto tempo (em segundos) o script fica rodando em loop dentro de
-# uma única execução do GitHub Actions, e de quanto em quanto tempo checa.
-# 270s (4m30s) com checagem a cada 30s garante que ele termina antes do
-# próximo agendamento do cron (a cada 5 minutos), sem sobrepor execuções.
-LOOP_DURATION_SECONDS = 270
-POLL_INTERVAL_SECONDS = 30
+# Quantos IDs de trades recentes guardar para checagem de duplicata.
+MAX_SEEN_IDS = 300
 
 STATE_FILE = os.path.join(os.path.dirname(__file__), "state.json")
 ACTIVITY_URL = "https://data-api.polymarket.com/activity"
 TELEGRAM_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 
-def load_last_seen_timestamp() -> int:
+def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r") as f:
                 data = json.load(f)
-                return int(data.get("last_timestamp", 0))
+                return {
+                    "last_timestamp": int(data.get("last_timestamp", 0)),
+                    "seen_ids": list(data.get("seen_ids", [])),
+                }
         except (json.JSONDecodeError, ValueError):
-            return 0
-    return 0
+            pass
+    return {"last_timestamp": 0, "seen_ids": []}
 
 
-def save_last_seen_timestamp(ts: int) -> None:
+def save_state(last_timestamp: int, seen_ids: list) -> None:
+    trimmed = seen_ids[-MAX_SEEN_IDS:]
     with open(STATE_FILE, "w") as f:
-        json.dump({"last_timestamp": ts}, f)
+        json.dump({"last_timestamp": last_timestamp, "seen_ids": trimmed}, f)
+
+
+def activity_unique_id(activity: dict) -> str:
+    tx_hash = activity.get("transactionHash")
+    if tx_hash:
+        return "-".join(str(activity.get(k, "")) for k in
+                         ["transactionHash", "asset", "side", "size", "price", "timestamp"])
+    return "-".join(str(activity.get(k, "")) for k in
+                     ["timestamp", "asset", "side", "size", "price", "outcome"])
 
 
 def fetch_activity(wallet: str, limit: int = 20):
@@ -102,52 +117,42 @@ def send_telegram_message(text: str) -> None:
         print(f"[ERRO] Falha ao enviar mensagem no Telegram: {resp.status_code} {resp.text}")
 
 
-def check_once(last_seen_ts: int, first_run: bool) -> int:
-    """Faz uma checagem e retorna o novo last_seen_ts."""
+def main():
+    state = load_state()
+    last_seen_ts = state["last_timestamp"]
+    seen_ids = state["seen_ids"]
+    first_run = last_seen_ts == 0
+
     activities = fetch_activity(WALLET_ADDRESS, limit=20)
 
     if first_run:
-        # Primeira execução: só marca o ponto de partida, não manda alertas do passado.
         if activities:
             newest_ts = int(activities[0]["timestamp"])
-            save_last_seen_timestamp(newest_ts)
+            new_seen_ids = (seen_ids + [activity_unique_id(a) for a in activities])[-MAX_SEEN_IDS:]
+            save_state(newest_ts, new_seen_ids)
             print(f"Primeira execução: marcando ponto de partida em {newest_ts}.")
-            return newest_ts
-        return last_seen_ts
+        return
 
-    new_activities = [a for a in activities if int(a.get("timestamp", 0)) > last_seen_ts]
-    new_activities.reverse()  # manda em ordem cronológica
+    candidates = [a for a in activities if int(a.get("timestamp", 0)) >= last_seen_ts]
+    candidates.reverse()  # ordem cronológica
 
-    for act in new_activities:
+    new_activities = []
+    for act in candidates:
+        uid = activity_unique_id(act)
+        if uid not in seen_ids:
+            new_activities.append((uid, act))
+
+    for uid, act in new_activities:
         msg = format_message(act)
         send_telegram_message(msg)
         print(f"[OK] Alerta enviado: {act.get('title')} ({act.get('side')})")
+        seen_ids.append(uid)
         last_seen_ts = max(last_seen_ts, int(act.get("timestamp", 0)))
 
     if new_activities:
-        save_last_seen_timestamp(last_seen_ts)
+        save_state(last_seen_ts, seen_ids)
     else:
         print("Nenhuma atividade nova.")
-
-    return last_seen_ts
-
-
-def main():
-    last_seen_ts = load_last_seen_timestamp()
-    first_run = last_seen_ts == 0
-
-    start_time = time.monotonic()
-    while True:
-        try:
-            last_seen_ts = check_once(last_seen_ts, first_run)
-            first_run = False
-        except requests.RequestException as e:
-            print(f"[ERRO] Falha ao consultar a API da Polymarket: {e}")
-
-        elapsed = time.monotonic() - start_time
-        if elapsed + POLL_INTERVAL_SECONDS > LOOP_DURATION_SECONDS:
-            break
-        time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
